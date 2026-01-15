@@ -1,0 +1,13 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.git
+.gitignore
+README.md
+DEPLOYMENT_INSTRUCTIONS.md
+.DS_Store
+*.log
