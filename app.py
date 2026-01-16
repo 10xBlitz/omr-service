@@ -14,6 +14,7 @@ import logging
 import os
 import base64
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 CORS(app)
@@ -229,14 +230,32 @@ def process_omr_sheet(image_url: str, num_questions: int) -> dict:
     # Extract individual question rows
     question_rows = extract_question_rows(image, num_questions)
 
-    # Analyze each row with AI
+    # Analyze each row with AI in parallel (faster!)
     results = []
-    for idx, row_img in enumerate(question_rows):
-        question_num = idx + 1
-        logger.info(f"Analyzing Q{question_num}...")
 
-        result = analyze_row_with_ai(row_img, question_num, api_key)
-        results.append(result)
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_question = {
+            executor.submit(analyze_row_with_ai, row_img, idx + 1, api_key): idx + 1
+            for idx, row_img in enumerate(question_rows)
+        }
+
+        for future in as_completed(future_to_question):
+            question_num = future_to_question[future]
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Q{question_num} failed: {e}")
+                results.append({
+                    'questionNumber': question_num,
+                    'selectedOption': '',
+                    'confidence': 0.0,
+                    'ambiguous': False,
+                    'notes': f'Error: {str(e)}'
+                })
+
+    # Sort results by question number
+    results.sort(key=lambda x: x['questionNumber'])
 
     logger.info(f"Completed {len(results)} questions")
 
