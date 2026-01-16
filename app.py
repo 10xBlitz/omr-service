@@ -1,7 +1,7 @@
 """
-OMR Processing Microservice V2
-Template-based approach for Korean CSAT OMR sheets
-Focuses on grid detection and darkness analysis instead of circle detection
+OMR Processing Microservice - Row-by-Row AI Approach
+Crops individual question rows and uses AI to detect filled bubbles
+Much more accurate than analyzing entire sheet at once
 """
 
 from flask import Flask, request, jsonify
@@ -11,6 +11,9 @@ import numpy as np
 import requests
 from io import BytesIO
 import logging
+import os
+import base64
+import json
 
 app = Flask(__name__)
 CORS(app)
@@ -20,222 +23,233 @@ logger = logging.getLogger(__name__)
 
 
 def download_image(url: str) -> np.ndarray:
-    """Download image from URL and convert to OpenCV format"""
-    logger.info(f"Downloading image from: {url}")
+    """Download image from URL"""
+    logger.info(f"Downloading: {url[:100]}...")
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
 
-    try:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
+    image_array = np.asarray(bytearray(response.content), dtype=np.uint8)
+    image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
 
-        logger.info(f"Image downloaded: {len(response.content)} bytes")
+    if image is None:
+        raise ValueError("Failed to decode image")
 
-        image_bytes = BytesIO(response.content)
-        image_array = np.asarray(bytearray(image_bytes.read()), dtype=np.uint8)
-        image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
-
-        if image is None:
-            raise ValueError("Failed to decode image")
-
-        logger.info(f"Image shape: {image.shape}")
-        return image
-
-    except Exception as e:
-        logger.error(f"Download error: {e}")
-        raise
+    logger.info(f"Image loaded: {image.shape}")
+    return image
 
 
-def preprocess_for_grid(image: np.ndarray) -> tuple:
-    """Preprocess image for grid detection"""
-    # Convert to grayscale
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-    # Apply bilateral filter to reduce noise while preserving edges
-    filtered = cv2.bilateralFilter(gray, 9, 75, 75)
-
-    # Apply adaptive thresholding
-    thresh = cv2.adaptiveThreshold(
-        filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 11, 2
-    )
-
-    return gray, thresh
-
-
-def detect_answer_grid_regions(image: np.ndarray, thresh: np.ndarray) -> list:
+def detect_answer_grid_bounds(image: np.ndarray) -> dict:
     """
-    Detect answer grid regions by finding rectangular contours
-    Korean OMR sheets have bordered answer sections
+    Detect the bounds of the answer grid area
+    Returns approximate coordinates for the main answer area
     """
-    # Find contours
-    contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    height, width = image.shape[:2]
 
-    # Filter contours by area and aspect ratio
-    grid_regions = []
-    img_area = image.shape[0] * image.shape[1]
+    # Korean OMR sheets typically have:
+    # - Top 15-20%: Student info (ignore)
+    # - Middle 60-70%: Answer grid
+    # - Bottom 10-15%: Instructions (ignore)
 
-    for contour in contours:
-        area = cv2.contourArea(contour)
+    # Start after student info section
+    grid_start_y = int(height * 0.15)
+    grid_end_y = int(height * 0.85)
 
-        # Grid regions are typically 5-30% of image area
-        if area < img_area * 0.02 or area > img_area * 0.5:
-            continue
+    # Answer columns are usually in the middle-right area
+    grid_start_x = int(width * 0.15)
+    grid_end_x = int(width * 0.95)
 
-        x, y, w, h = cv2.boundingRect(contour)
-
-        # Answer grids are wider than tall (multiple columns)
-        aspect_ratio = w / h if h > 0 else 0
-
-        if 0.8 < aspect_ratio < 3.0 and w > 200 and h > 300:
-            grid_regions.append({
-                'x': x, 'y': y, 'w': w, 'h': h,
-                'area': area
-            })
-
-    # Sort by position (left to right, top to bottom)
-    grid_regions.sort(key=lambda r: (r['y'], r['x']))
-
-    logger.info(f"Detected {len(grid_regions)} potential answer grid regions")
-    return grid_regions
+    return {
+        'x': grid_start_x,
+        'y': grid_start_y,
+        'width': grid_end_x - grid_start_x,
+        'height': grid_end_y - grid_start_y
+    }
 
 
-def extract_answers_from_grid(image: np.ndarray, gray: np.ndarray,
-                               grid: dict, num_questions: int) -> list:
+def extract_question_rows(image: np.ndarray, num_questions: int) -> list:
     """
-    Extract answers from a single grid region
-    Uses grid-based sampling instead of circle detection
+    Divide the answer grid into individual question rows
+    Returns list of cropped images, one per question
     """
-    x, y, w, h = grid['x'], grid['y'], grid['w'], grid['h']
+    grid_bounds = detect_answer_grid_bounds(image)
+
+    x = grid_bounds['x']
+    y = grid_bounds['y']
+    width = grid_bounds['width']
+    height = grid_bounds['height']
 
     # Extract grid region
-    grid_img = gray[y:y+h, x:x+w]
+    grid_image = image[y:y+height, x:x+width]
 
-    # Apply threshold to get binary image
-    _, grid_thresh = cv2.threshold(grid_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # Calculate row height based on number of questions
+    # Assume max 20 questions per column for Korean OMR
+    rows_per_column = min(num_questions, 20)
+    row_height = height // rows_per_column
 
-    # Estimate number of rows and columns
-    # Korean OMR typically has 2-3 columns with ~20 rows each
-    estimated_rows_per_column = min(num_questions, 20)
-    num_columns = 2  # Usually 2 main sections (문번 + 답란) per column set
+    question_rows = []
 
-    # Calculate cell dimensions
-    row_height = h // estimated_rows_per_column
+    for q in range(num_questions):
+        # Determine which column this question is in
+        column_idx = q // rows_per_column
+        row_in_column = q % rows_per_column
 
-    # For each question, sample the answer area
-    results = []
+        # Calculate column offset (for multi-column layouts)
+        column_width = width // 2  # Assume 2 main columns
+        col_x = column_idx * column_width
 
-    # Simplified approach: divide horizontally into sections
-    # Assume 2 main column sets (Q1-20 left, Q21+ right if exists)
-    questions_per_section = min(num_questions, 20)
+        # Calculate row position
+        row_y = row_in_column * row_height
 
-    for q in range(1, num_questions + 1):
-        # Determine which section (left or right column set)
-        section_idx = (q - 1) // questions_per_section
-        question_in_section = ((q - 1) % questions_per_section)
+        # Add some padding to ensure we get the full row
+        padding = int(row_height * 0.1)
+        row_y_start = max(0, row_y - padding)
+        row_y_end = min(grid_image.shape[0], row_y + row_height + padding)
+        row_x_start = max(0, col_x)
+        row_x_end = min(grid_image.shape[1], col_x + column_width)
 
-        # Estimate row position
-        row_y = int(question_in_section * row_height)
+        # Crop the row
+        row_img = grid_image[row_y_start:row_y_end, row_x_start:row_x_end]
 
-        if row_y + row_height > h:
-            row_y = h - row_height
+        if row_img.size > 0:
+            question_rows.append(row_img)
+        else:
+            # Fallback: use a blank image
+            question_rows.append(np.zeros((50, width, 3), dtype=np.uint8))
 
-        # Extract row
-        row_img = grid_thresh[row_y:row_y + row_height, :]
+    logger.info(f"Extracted {len(question_rows)} question rows")
+    return question_rows
 
-        if row_img.size == 0:
-            results.append({
-                'questionNumber': q,
-                'selectedOption': '',
-                'confidence': 0.0,
-                'notes': 'Could not extract row'
-            })
-            continue
 
-        # Divide row into 5 answer positions
-        # Skip first part (question number area)
-        answer_start = int(w * 0.2)  # First 20% is question number
-        answer_width = w - answer_start
-        bubble_width = answer_width // 5
+def image_to_base64(image: np.ndarray) -> str:
+    """Convert OpenCV image to base64 string"""
+    _, buffer = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    base64_str = base64.b64encode(buffer).decode('utf-8')
+    return f"data:image/jpeg;base64,{base64_str}"
 
-        densities = []
-        for pos in range(5):
-            bubble_x = answer_start + (pos * bubble_width)
-            bubble_region = row_img[:, bubble_x:bubble_x + bubble_width]
 
-            if bubble_region.size == 0:
-                densities.append(0.0)
-                continue
+def analyze_row_with_ai(row_image: np.ndarray, question_number: int, api_key: str) -> dict:
+    """
+    Use OpenAI to analyze a single question row
+    Much simpler task = higher accuracy
+    """
+    # Convert row to base64
+    base64_image = image_to_base64(row_image)
 
-            # Calculate darkness (white pixels in inverted image = dark in original)
-            darkness = np.sum(bubble_region > 0) / bubble_region.size
-            densities.append(darkness)
+    # Simple, focused prompt for a single row
+    prompt = f"""This is ONE row from a Korean OMR answer sheet for question {question_number}.
 
-        # Find darkest bubble
-        if not densities or max(densities) < 0.1:
-            # No clear answer
-            results.append({
-                'questionNumber': q,
+You will see 5 answer bubbles numbered ① ② ③ ④ ⑤ (or 1 2 3 4 5).
+
+FILLED bubble = SOLID BLACK or DARK SHADED inside
+EMPTY bubble = Pink/orange circle with visible number
+
+Look at the 5 bubbles from LEFT to RIGHT.
+Which position (1, 2, 3, 4, or 5) is FILLED/DARK?
+
+Return JSON:
+{{"selectedOption": "X", "confidence": 0.95}}
+
+Where X is "1", "2", "3", "4", or "5" for the filled bubble, or "" if none filled."""
+
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}"
+            },
+            json={
+                "model": "gpt-4o",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": base64_image, "detail": "high"}}
+                        ]
+                    }
+                ],
+                "max_tokens": 50,
+                "temperature": 0.0,
+                "response_format": {"type": "json_object"}
+            },
+            timeout=30
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+            content = result['choices'][0]['message']['content']
+            parsed = json.loads(content)
+
+            selected = parsed.get('selectedOption', '')
+            confidence = parsed.get('confidence', 0.8)
+
+            logger.info(f"Q{question_number}: {selected} (conf: {confidence})")
+
+            return {
+                'questionNumber': question_number,
+                'selectedOption': selected,
+                'confidence': float(confidence),
+                'ambiguous': False,
+                'notes': 'Row-by-row AI'
+            }
+        else:
+            logger.error(f"AI error Q{question_number}: {response.status_code}")
+            return {
+                'questionNumber': question_number,
                 'selectedOption': '',
                 'confidence': 0.0,
                 'ambiguous': False,
-                'notes': 'No answer detected'
-            })
-        else:
-            max_density = max(densities)
-            selected_pos = densities.index(max_density) + 1
+                'notes': f'AI error: {response.status_code}'
+            }
 
-            # Check for ambiguous (multiple dark bubbles)
-            dark_count = sum(1 for d in densities if d > max_density * 0.7)
-            ambiguous = dark_count > 1
-
-            results.append({
-                'questionNumber': q,
-                'selectedOption': str(selected_pos) if not ambiguous else '',
-                'confidence': float(max_density),
-                'ambiguous': ambiguous,
-                'notes': f'Density: {max_density:.2f}' + (' - Multiple marks' if ambiguous else '')
-            })
-
-    return results
+    except Exception as e:
+        logger.error(f"Exception Q{question_number}: {e}")
+        return {
+            'questionNumber': question_number,
+            'selectedOption': '',
+            'confidence': 0.0,
+            'ambiguous': False,
+            'notes': f'Error: {str(e)}'
+        }
 
 
 def process_omr_sheet(image_url: str, num_questions: int) -> dict:
-    """Main OMR processing function"""
-    logger.info(f"Processing OMR with {num_questions} questions")
+    """Main processing function"""
+    logger.info(f"Processing {num_questions} questions with row-by-row AI")
+
+    # Get OpenAI API key
+    api_key = os.environ.get('OPENAI_API_KEY')
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY not set")
 
     # Download image
     image = download_image(image_url)
 
-    # Preprocess
-    gray, thresh = preprocess_for_grid(image)
+    # Extract individual question rows
+    question_rows = extract_question_rows(image, num_questions)
 
-    # Detect grid regions
-    grid_regions = detect_answer_grid_regions(image, thresh)
+    # Analyze each row with AI
+    results = []
+    for idx, row_img in enumerate(question_rows):
+        question_num = idx + 1
+        logger.info(f"Analyzing Q{question_num}...")
 
-    if not grid_regions:
-        # Fallback: use entire image as one grid
-        logger.warning("No grid regions detected, using full image")
-        grid_regions = [{
-            'x': 0, 'y': int(image.shape[0] * 0.2),  # Skip top 20% (headers)
-            'w': image.shape[1], 'h': int(image.shape[0] * 0.7)
-        }]
+        result = analyze_row_with_ai(row_img, question_num, api_key)
+        results.append(result)
 
-    # Extract answers from the largest/best grid region
-    main_grid = max(grid_regions, key=lambda g: g['area'] if 'area' in g else g['w'] * g['h'])
-
-    results = extract_answers_from_grid(image, gray, main_grid, num_questions)
-
-    logger.info(f"Extracted {len(results)} answers")
+    logger.info(f"Completed {len(results)} questions")
 
     return {
         'answers': results,
-        'totalDetected': len(grid_regions) * 5 * num_questions if grid_regions else 0,
+        'totalDetected': len(results),
         'rowsDetected': num_questions
     }
 
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'healthy', 'version': 'v2-grid-based'}), 200
+    return jsonify({'status': 'healthy', 'version': 'row-by-row-ai'}), 200
 
 
 @app.route('/process-omr', methods=['POST'])
