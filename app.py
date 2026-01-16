@@ -228,8 +228,8 @@ def process_omr_sheet(image_url: str, num_questions: int) -> dict:
 
     return {
         'answers': results,
-        'totalDetected': len(results),
-        'gridRegions': len(grid_regions)
+        'totalDetected': len(grid_regions) * 5 * num_questions if grid_regions else 0,
+        'rowsDetected': num_questions
     }
 
 
