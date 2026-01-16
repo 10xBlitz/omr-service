@@ -21,11 +21,27 @@ logger = logging.getLogger(__name__)
 
 def download_image(url: str) -> np.ndarray:
     """Download image from URL and convert to OpenCV format"""
-    response = requests.get(url)
-    image_bytes = BytesIO(response.content)
-    image_array = np.asarray(bytearray(image_bytes.read()), dtype=np.uint8)
-    image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
-    return image
+    logger.info(f"Downloading image from: {url}")
+
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+
+        logger.info(f"Image downloaded: {len(response.content)} bytes")
+
+        image_bytes = BytesIO(response.content)
+        image_array = np.asarray(bytearray(image_bytes.read()), dtype=np.uint8)
+        image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+
+        if image is None:
+            raise ValueError("Failed to decode image - invalid format")
+
+        logger.info(f"Image decoded: shape={image.shape}, dtype={image.dtype}")
+        return image
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to download image: {e}")
+        raise ValueError(f"Could not download image from URL: {str(e)}")
 
 
 def preprocess_image(image: np.ndarray) -> np.ndarray:
@@ -40,20 +56,33 @@ def preprocess_image(image: np.ndarray) -> np.ndarray:
 
 def detect_circles(image: np.ndarray) -> list:
     """Detect circular bubbles using Hough Circle Transform"""
-    circles = cv2.HoughCircles(
-        image,
-        cv2.HOUGH_GRADIENT,
-        dp=1,
-        minDist=20,  # Minimum distance between circle centers
-        param1=50,
-        param2=30,
-        minRadius=10,
-        maxRadius=40
-    )
+    # Try multiple parameter sets for better detection
+    param_sets = [
+        # (param1, param2, minRadius, maxRadius, minDist)
+        (50, 30, 8, 50, 15),   # Original
+        (50, 25, 8, 50, 15),   # More lenient
+        (40, 20, 8, 50, 12),   # Very lenient
+        (30, 15, 5, 60, 10),   # Most lenient
+    ]
 
-    if circles is not None:
-        circles = np.uint16(np.around(circles))
-        return circles[0, :].tolist()
+    for param1, param2, minRadius, maxRadius, minDist in param_sets:
+        circles = cv2.HoughCircles(
+            image,
+            cv2.HOUGH_GRADIENT,
+            dp=1,
+            minDist=minDist,
+            param1=param1,
+            param2=param2,
+            minRadius=minRadius,
+            maxRadius=maxRadius
+        )
+
+        if circles is not None:
+            circles = np.uint16(np.around(circles))
+            logger.info(f"Detected {len(circles[0])} circles with params: p1={param1}, p2={param2}")
+            return circles[0, :].tolist()
+
+    logger.warning("No circles detected with any parameter set")
     return []
 
 
